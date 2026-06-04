@@ -30,7 +30,8 @@ go run . call 99xxxxxx   # register, then place a call and play a test clip
 
 - **Inbound** (while running): incoming calls are answered. With `FORWARD_TO`
   set, the caller is bridged to that number when they press **1**; otherwise it
-  plays a prompt and echoes their audio.
+  plays a prompt and echoes their audio. At most `FORWARD_CONCURRENCY` forwards
+  run at once — extra callers are held on hold in a FIFO queue up to `QUEUE_TIMEOUT`.
 - **Outbound** (`call <number>`): dials and plays a test clip on answer.
 
 ## Deploy (Docker / GHCR)

@@ -101,6 +101,11 @@ type config struct {
 	// ForwardTo, if set, turns inbound handling into a "press 1 to be forwarded"
 	// IVR: when the caller presses 1 we bridge them to this number.
 	ForwardTo string // FORWARD_TO
+
+	// Concurrency: at most ForwardConcurrency calls are bridged to ForwardTo at
+	// once; extra callers wait (hearing hold audio) in a FIFO queue up to QueueTimeout.
+	ForwardConcurrency int           // FORWARD_CONCURRENCY (default 1)
+	QueueTimeout       time.Duration // QUEUE_TIMEOUT seconds (default 120)
 }
 
 func loadConfig() (config, error) {
@@ -120,13 +125,19 @@ func loadConfig() (config, error) {
 
 		PublicHost: os.Getenv("PUBLIC_HOST"),
 		Stun:       getenvDefault("STUN_SERVER", "stun.l.google.com:19302"),
-		ForwardTo:  os.Getenv("FORWARD_TO"),
+
+		ForwardTo:          os.Getenv("FORWARD_TO"),
+		ForwardConcurrency: getenvInt("FORWARD_CONCURRENCY", 1),
+		QueueTimeout:       time.Duration(getenvInt("QUEUE_TIMEOUT", 120)) * time.Second,
 	}
 	if c.Domain == "" || c.User == "" || c.Pass == "" {
 		return c, errors.New("SIP_DOMAIN, SIP_USER and SIP_PASS must be set (copy .env.example to .env and fill them in)")
 	}
 	if c.AuthUser == "" {
 		c.AuthUser = c.User
+	}
+	if c.ForwardConcurrency < 1 {
+		c.ForwardConcurrency = 1
 	}
 	if c.BindHost == "" {
 		ip, err := outboundIP(net.JoinHostPort(c.Domain, strconv.Itoa(c.Port)))
@@ -225,6 +236,10 @@ func run(ctx context.Context, cfg config, callDest string) error {
 		logArgs = append(logArgs, "rtp_ports", fmt.Sprintf("%d-%d/udp", media.RTPPortStart, media.RTPPortEnd))
 	}
 	slog.Info("registering", logArgs...)
+
+	// Forward queue: cap concurrent forwards; extra callers wait (on hold) FIFO.
+	forward.sem = make(chan struct{}, cfg.ForwardConcurrency)
+	forward.timeout = cfg.QueueTimeout
 
 	// Answer inbound calls. With FORWARD_TO set this is a "press 1 to forward"
 	// IVR; otherwise it plays a prompt and echoes.
@@ -458,7 +473,7 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 	// while we wait. Stop it before doing anything else with the media.
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	go func() { defer close(done); loopPrompt(in, stop) }()
+	go func() { defer close(done); loopPlay(in, "demo-echotest.wav", stop) }()
 
 	matched := waitForForwardDigit(in, digits, '1', 20*time.Second)
 	close(stop)
@@ -468,14 +483,22 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 		slog.Info("no '1' pressed within timeout — hanging up")
 		return
 	}
+
+	// Cap concurrent forwards; hold extra callers in a FIFO queue until a slot frees.
+	if !acquireForwardSlot(in) {
+		slog.Info("queue timed out or caller left before a slot was free", "dialog", in.ID)
+		return
+	}
+	defer func() { <-forward.sem }()
+
 	if err := forwardCall(dg, cfg, in); err != nil {
 		slog.Error("forward failed", "error", err)
 	}
 }
 
-// loopPrompt plays the prompt clip repeatedly until stop is closed, keeping
-// outbound RTP flowing (NAT latch) while we wait for the caller to press 1.
-func loopPrompt(in *diago.DialogServerSession, stop <-chan struct{}) {
+// loopPlay plays a clip from testdata repeatedly until stop is closed, keeping
+// outbound RTP flowing (NAT latch / hold music) and giving the caller audio.
+func loopPlay(in *diago.DialogServerSession, file string, stop <-chan struct{}) {
 	pb, err := in.PlaybackCreate()
 	if err != nil {
 		slog.Warn("create playback", "error", err)
@@ -487,7 +510,7 @@ func loopPrompt(in *diago.DialogServerSession, stop <-chan struct{}) {
 			return
 		default:
 		}
-		wav, err := testdata.OpenFile("demo-echotest.wav")
+		wav, err := testdata.OpenFile(file)
 		if err != nil {
 			return
 		}
@@ -527,6 +550,44 @@ func waitForForwardDigit(in *diago.DialogServerSession, digits <-chan rune, want
 		case <-in.Context().Done():
 			return false
 		}
+	}
+}
+
+// forward limits concurrent forwards and holds extra callers in a FIFO queue.
+// A buffered slot in sem == one active forward; Go wakes blocked senders in order.
+var forward struct {
+	sem     chan struct{}
+	timeout time.Duration
+}
+
+// acquireForwardSlot takes a forward slot. If all are busy it holds the caller
+// with audio and waits (FIFO) for one to free, returning false if the caller
+// hangs up or the queue wait exceeds QueueTimeout. Release with `<-forward.sem`.
+func acquireForwardSlot(in *diago.DialogServerSession) bool {
+	select {
+	case forward.sem <- struct{}{}:
+		return true // a slot was immediately free
+	default:
+	}
+
+	slog.Info("forward slots full — holding caller in queue",
+		"dialog", in.ID, "active", len(forward.sem), "capacity", cap(forward.sem))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { defer close(done); loopPlay(in, "demo-echotest.wav", stop) }()
+	defer func() { close(stop); <-done }()
+
+	t := time.NewTimer(forward.timeout)
+	defer t.Stop()
+	select {
+	case forward.sem <- struct{}{}:
+		slog.Info("slot freed — connecting queued caller", "dialog", in.ID)
+		return true
+	case <-t.C:
+		return false
+	case <-in.Context().Done():
+		return false
 	}
 }
 
