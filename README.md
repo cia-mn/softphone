@@ -61,6 +61,31 @@ docker build -t softphone .
 docker run --rm --network host --env-file .env -e BIND_HOST=<ip> softphone
 ```
 
+### Ports to open (firewall / security group)
+
+`network_mode: host` binds directly to the host, so there's no Docker port
+mapping — open these **inbound UDP** rules on the server (cloud security group
+and/or host firewall). Pin fixed ports so they're predictable:
+
+| Port (UDP) | Purpose |
+|------------|---------|
+| `BIND_PORT` — e.g. **5060** | SIP signalling |
+| `RTP_PORT_START`–`RTP_PORT_END` — e.g. **10000–10100** | RTP/RTCP audio |
+
+Recommended server `.env` for deployment:
+
+```ini
+BIND_HOST=<public-ip>
+BIND_PORT=5060
+RTP_PORT_START=10000
+RTP_PORT_END=10100
+```
+
+Each call leg uses 2 ports (RTP + RTCP); a *forwarded* call has 2 legs (4 ports),
+so a 100-port range handles plenty of concurrent calls. Everything is **UDP**
+(only `SIP_TRANSPORT=tls/tcp` would add a TCP port). Outbound has no inbound-port
+requirement — only inbound calls/media do.
+
 ## Troubleshooting
 
 - Raw SIP messages: set `LOG_LEVEL=debug`.

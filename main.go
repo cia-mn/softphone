@@ -83,8 +83,13 @@ type config struct {
 	Port      int           // SIP_PORT    registrar port (default 5060)
 	Transport string        // SIP_TRANSPORT  udp|tcp|tls (default udp)
 	BindHost  string        // BIND_HOST   local IP to bind/advertise (default: auto-detected outbound IP)
-	BindPort  int           // BIND_PORT   local port (default 0 = OS picks a free port)
+	BindPort  int           // BIND_PORT   local SIP port (default 0 = OS picks a free port; set a fixed one to deploy)
 	Expiry    time.Duration // SIP_EXPIRY  requested registration lifetime in seconds (default 60)
+
+	// RTP media UDP port range. 0/0 = OS ephemeral ports (fine locally). Set a
+	// fixed range to deploy behind a firewall so you can open exactly these ports.
+	RTPPortStart int // RTP_PORT_START
+	RTPPortEnd   int // RTP_PORT_END
 
 	// NAT: the public address to advertise in Contact/SDP so inbound calls and
 	// their media can reach us. If PublicHost is empty, it is auto-discovered via
@@ -108,6 +113,9 @@ func loadConfig() (config, error) {
 		Port:      getenvInt("SIP_PORT", 5060),
 		BindPort:  getenvInt("BIND_PORT", 0),
 		Expiry:    time.Duration(getenvInt("SIP_EXPIRY", 60)) * time.Second,
+
+		RTPPortStart: getenvInt("RTP_PORT_START", 0),
+		RTPPortEnd:   getenvInt("RTP_PORT_END", 0),
 
 		PublicHost: os.Getenv("PUBLIC_HOST"),
 		Stun:       getenvDefault("STUN_SERVER", "stun.l.google.com:19302"),
@@ -178,6 +186,13 @@ func run(ctx context.Context, cfg config, callDest string) error {
 		}
 	}
 
+	// Constrain the RTP/RTCP UDP port range so a firewall can be opened predictably.
+	// (media.RTPPortStart/End are global; 0/0 leaves it to OS ephemeral ports.)
+	if cfg.RTPPortStart > 0 && cfg.RTPPortEnd > cfg.RTPPortStart {
+		media.RTPPortStart = cfg.RTPPortStart
+		media.RTPPortEnd = cfg.RTPPortEnd
+	}
+
 	tr := diago.Transport{
 		Transport:      cfg.Transport,
 		BindHost:       cfg.BindHost,
@@ -199,6 +214,9 @@ func run(ctx context.Context, cfg config, callDest string) error {
 	}
 	if tr.MediaExternalIP != nil {
 		logArgs = append(logArgs, "media_public_ip", tr.MediaExternalIP.String())
+	}
+	if media.RTPPortStart > 0 {
+		logArgs = append(logArgs, "rtp_ports", fmt.Sprintf("%d-%d/udp", media.RTPPortStart, media.RTPPortEnd))
 	}
 	slog.Info("registering", logArgs...)
 

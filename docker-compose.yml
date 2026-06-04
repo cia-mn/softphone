@@ -1,0 +1,31 @@
+# Run the softphone as an always-on service: register, answer inbound calls, and
+# forward (press 1 → FORWARD_TO).
+#
+#   docker compose up -d        # pull the image and start
+#   docker compose logs -f      # watch the logs
+#   docker compose down         # stop
+#
+# Requires a Linux host (network_mode: host) with a PUBLIC IP. Put your settings
+# in .env (copy from .env.example) and set BIND_HOST to that public IP.
+
+services:
+  softphone:
+    image: ghcr.io/cia-mn/softphone:latest
+    # To build from source instead of pulling, comment out `image:` above and
+    # uncomment the next line:
+    # build: .
+    container_name: softphone
+    restart: unless-stopped
+
+    # SIP signalling + the dynamic RTP port range need the host network stack.
+    # (Linux only; not supported on Docker Desktop for Mac/Windows.)
+    network_mode: host
+
+    # All configuration — SIP_USER, SIP_PASS, FORWARD_TO, BIND_HOST=<public ip>, …
+    env_file: .env
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
