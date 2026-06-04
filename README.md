@@ -36,8 +36,10 @@ go run . call 99xxxxxx   # register, then place a call and play a test clip
 ## Deploy (Docker / GHCR)
 
 > ⚠️ **Inbound calls need a publicly reachable host.** Behind NAT the carrier
-> can't reliably deliver the call's ACK/media. Run on a host with a **public IP**
-> and set `BIND_HOST` to it. (Outbound works from anywhere.)
+> can't reliably deliver the call's ACK/media. Run on a host with a **public IP**.
+> `BIND_HOST` is the local interface to bind (leave empty to auto-detect — don't
+> put a 1:1-NAT public IP there); `PUBLIC_HOST` is the public IP to advertise.
+> (Outbound works from anywhere.)
 
 The GitHub Actions workflow ([.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml))
 publishes a multi-arch image to GHCR on every push to `main` and on `v*` tags.
@@ -47,9 +49,12 @@ Pull and run it on your server:
 docker run -d --name softphone \
   --network host \
   --env-file .env \
-  -e BIND_HOST=<public-ip-of-this-host> \
+  -e PUBLIC_HOST=<public-ip-of-this-host> \
   ghcr.io/cia-mn/softphone:latest
 ```
+
+(If the public IP is assigned directly to the host's interface — `ip addr` shows
+it — you can instead set `BIND_HOST` to it and skip `PUBLIC_HOST`.)
 
 - `--network host` lets SIP + the dynamic RTP ports work without mapping a range.
 - Config comes from `--env-file .env` or `-e` flags — **no secrets are baked into the image**.
@@ -58,7 +63,7 @@ Build locally instead (needs Docker BuildKit/buildx):
 
 ```sh
 docker build -t softphone .
-docker run --rm --network host --env-file .env -e BIND_HOST=<ip> softphone
+docker run --rm --network host --env-file .env -e PUBLIC_HOST=<public-ip> softphone
 ```
 
 ### Ports to open (firewall / security group)
@@ -75,11 +80,15 @@ and/or host firewall). Pin fixed ports so they're predictable:
 Recommended server `.env` for deployment:
 
 ```ini
-BIND_HOST=<public-ip>
+BIND_HOST=                 # empty = auto-detect this host's interface IP
+PUBLIC_HOST=<public-ip>    # the IP advertised to the carrier (Contact/SDP)
 BIND_PORT=5060
 RTP_PORT_START=10000
 RTP_PORT_END=10100
 ```
+
+(If `ip addr` shows the public IP directly on the interface, set `BIND_HOST` to
+it and leave `PUBLIC_HOST` empty — then the SIP Contact is public too.)
 
 Each call leg uses 2 ports (RTP + RTCP); a *forwarded* call has 2 legs (4 ports),
 so a 100-port range handles plenty of concurrent calls. Everything is **UDP**

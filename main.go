@@ -364,8 +364,20 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 		return
 	}
 
-	slog.Info("ANSWERED ✓ — waiting for caller to press 1 to forward", "forward_to", cfg.ForwardTo)
+	slog.Info("ANSWERED ✓ — playing prompt, waiting for caller to press 1", "forward_to", cfg.ForwardTo)
+
+	// Play a prompt on a loop WHILE listening for DTMF. The continuous outbound
+	// RTP keeps the media path latched through NAT — so the caller's RTP (and the
+	// DTMF telephone-event packets) actually reach us — and it cues the caller.
+	// (Reading DTMF only sets a read deadline, so a concurrent write is safe.)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { defer close(done); loopPrompt(in, stop) }()
+
 	matched, err := waitForDigit(in, '1', 20*time.Second)
+	close(stop) // stop the prompt …
+	<-done      // … and wait for it to stop writing before we touch the media again
+
 	if err != nil {
 		slog.Error("DTMF listen failed", "error", err)
 		return
@@ -376,6 +388,44 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 	}
 	if err := forwardCall(dg, cfg, in); err != nil {
 		slog.Error("forward failed", "error", err)
+	}
+}
+
+// loopPrompt plays the prompt clip repeatedly until stop is closed, keeping
+// outbound RTP flowing (NAT latch) while we wait for the caller to press 1.
+func loopPrompt(in *diago.DialogServerSession, stop <-chan struct{}) {
+	pb, err := in.PlaybackCreate()
+	if err != nil {
+		slog.Warn("create playback", "error", err)
+		return
+	}
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		wav, err := testdata.OpenFile("demo-echotest.wav")
+		if err != nil {
+			return
+		}
+		_, _ = pb.Play(&stoppableReader{r: wav, stop: stop}, "audio/wav")
+		wav.Close()
+	}
+}
+
+// stoppableReader makes a blocking Play return (EOF) as soon as stop is closed.
+type stoppableReader struct {
+	r    io.Reader
+	stop <-chan struct{}
+}
+
+func (s *stoppableReader) Read(p []byte) (int, error) {
+	select {
+	case <-s.stop:
+		return 0, io.EOF
+	default:
+		return s.r.Read(p)
 	}
 }
 
