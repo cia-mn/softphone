@@ -42,12 +42,15 @@ Calls use **8 kHz mono 16-bit WAV**. Convert any MP3 with ffmpeg:
 ffmpeg -i sounds/start.mp3 -ar 8000 -ac 1 -c:a pcm_s16le sounds/start.wav
 ```
 
-Point the app at the WAVs (these are the defaults):
+The forward flow uses three clips (defaults shown):
 
 ```ini
-PROMPT_FILE=sounds/start.wav          # played while waiting for "press 1"
-HOLD_FILE=sounds/waiting-queue.wav    # hold music for queued callers
+PROMPT_FILE=sounds/start.wav                # greeting while waiting for "press 1"
+CONNECTING_FILE=sounds/calling-forward.wav  # "connecting…" while the forward leg rings
+HOLD_FILE=sounds/waiting-queue.wav          # hold music while queued (slots full)
 ```
+
+So a forwarded call sounds like: **greeting → press 1 → "connecting…" → far end answers → talking**; if all forward slots are busy, the caller hears the hold clip until one frees.
 
 A path that doesn't exist falls back to a bundled demo clip. In Docker the
 compose file mounts `./sounds` → `/sounds`, and the container's working dir is

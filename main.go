@@ -109,8 +109,9 @@ type config struct {
 
 	// Audio clips (8 kHz mono 16-bit WAV). A path on disk is used if it exists;
 	// otherwise the name falls back to a bundled demo clip.
-	PromptFile string // PROMPT_FILE  played on inbound while waiting for the keypress
-	HoldFile   string // HOLD_FILE    hold audio while a caller waits in the forward queue
+	PromptFile     string // PROMPT_FILE      greeting played while waiting for the keypress
+	ConnectingFile string // CONNECTING_FILE  "connecting…" played while the forward leg rings
+	HoldFile       string // HOLD_FILE        hold audio while a caller waits in the forward queue
 }
 
 func loadConfig() (config, error) {
@@ -135,8 +136,9 @@ func loadConfig() (config, error) {
 		ForwardConcurrency: getenvInt("FORWARD_CONCURRENCY", 1),
 		QueueTimeout:       time.Duration(getenvInt("QUEUE_TIMEOUT", 120)) * time.Second,
 
-		PromptFile: getenvDefault("PROMPT_FILE", "sounds/calling-forward.wav"),
-		HoldFile:   getenvDefault("HOLD_FILE", "sounds/waiting-queue.wav"),
+		PromptFile:     getenvDefault("PROMPT_FILE", "sounds/start.wav"),
+		ConnectingFile: getenvDefault("CONNECTING_FILE", "sounds/calling-forward.wav"),
+		HoldFile:       getenvDefault("HOLD_FILE", "sounds/waiting-queue.wav"),
 	}
 	if c.Domain == "" || c.User == "" || c.Pass == "" {
 		return c, errors.New("SIP_DOMAIN, SIP_USER and SIP_PASS must be set (copy .env.example to .env and fill them in)")
@@ -249,10 +251,12 @@ func run(ctx context.Context, cfg config, callDest string) error {
 	forward.sem = make(chan struct{}, cfg.ForwardConcurrency)
 	forward.timeout = cfg.QueueTimeout
 	forward.holdFile = cfg.HoldFile
+	forward.connectingFile = cfg.ConnectingFile
 
 	if cfg.ForwardTo != "" {
 		slog.Info("audio clips",
 			"prompt", cfg.PromptFile, "prompt_from", audioSource(cfg.PromptFile),
+			"connecting", cfg.ConnectingFile, "connecting_from", audioSource(cfg.ConnectingFile),
 			"hold", cfg.HoldFile, "hold_from", audioSource(cfg.HoldFile))
 	}
 
@@ -604,9 +608,10 @@ func waitForForwardDigit(in *diago.DialogServerSession, digits <-chan rune, want
 // forward limits concurrent forwards and holds extra callers in a FIFO queue.
 // A buffered slot in sem == one active forward; Go wakes blocked senders in order.
 var forward struct {
-	sem      chan struct{}
-	timeout  time.Duration
-	holdFile string
+	sem            chan struct{}
+	timeout        time.Duration
+	holdFile       string
+	connectingFile string
 }
 
 // acquireForwardSlot takes a forward slot. If all are busy it holds the caller
@@ -640,41 +645,61 @@ func acquireForwardSlot(in *diago.DialogServerSession) bool {
 	}
 }
 
-// forwardCall bridges the (already answered) caller to cfg.ForwardTo by placing a
-// second outbound call and connecting the two legs — a back-to-back user agent.
+// forwardCall connects the (already answered) caller to cfg.ForwardTo as a
+// back-to-back user agent: it plays a "connecting…" announcement to the caller
+// while the outbound leg rings, then bridges the two answered legs so audio flows.
 func forwardCall(dg *diago.Diago, cfg config, in *diago.DialogServerSession) error {
 	dest := fmt.Sprintf("sip:%s@%s", cfg.ForwardTo, cfg.Domain)
 	var recipient sip.Uri
 	if err := sip.ParseUri(dest, &recipient); err != nil {
 		return fmt.Errorf("parse forward target %q: %w", dest, err)
 	}
-	slog.Info("forwarding (bridging)", "to", dest)
-
-	bridge := diago.NewBridge()
-	if err := bridge.AddDialogSession(in); err != nil {
-		return fmt.Errorf("add caller to bridge: %w", err)
-	}
+	slog.Info("forwarding", "to", dest)
 
 	inCtx := in.Context()
 	dialCtx, cancel := context.WithTimeout(inCtx, 60*time.Second)
 	defer cancel()
 
-	// Present our own account as the caller so VoipSwitch authorizes the new leg.
+	// Play "connecting…" to the caller while the far end rings (so they don't hear
+	// silence). Stopped before bridging so we never double-write the caller's media.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { defer close(done); loopPlay(in, forward.connectingFile, stop) }()
+
+	// Present our own account as caller-id so VoipSwitch authorizes the leg, and
+	// pass the caller as Originator so the outbound negotiates the SAME codec
+	// (the bridge can't transcode).
 	from := &sip.FromHeader{
 		DisplayName: cfg.User,
 		Address:     sip.Uri{Scheme: "sip", User: cfg.User, Host: cfg.Domain},
 		Params:      sip.NewParams(),
 	}
-	out, err := dg.InviteBridge(dialCtx, recipient, &bridge, diago.InviteOptions{
-		Username: cfg.AuthUser,
-		Password: cfg.Pass,
-		Headers:  []sip.Header{from},
+	out, err := dg.Invite(dialCtx, recipient, diago.InviteOptions{
+		Originator: in,
+		Username:   cfg.AuthUser,
+		Password:   cfg.Pass,
+		Headers:    []sip.Header{from},
+		OnResponse: func(res *sip.Response) error {
+			slog.Info("forward leg", "response", res.StartLine())
+			return nil
+		},
 	})
+	close(stop)
+	<-done // stop the announcement before media bridging begins
 	if err != nil {
 		return fmt.Errorf("outbound leg to %s failed: %w", cfg.ForwardTo, err)
 	}
 	defer out.Close()
 	slog.Info("BRIDGED ✓ — caller connected to forward target", "to", cfg.ForwardTo)
+
+	// Bridge the two answered legs (relay starts when the second is added).
+	bridge := diago.NewBridge()
+	if err := bridge.AddDialogSession(in); err != nil {
+		return fmt.Errorf("bridge add caller: %w", err)
+	}
+	if err := bridge.AddDialogSession(out); err != nil {
+		return fmt.Errorf("bridge add target: %w", err)
+	}
 
 	outCtx := out.Context()
 	defer in.Hangup(inCtx)
