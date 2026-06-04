@@ -135,7 +135,7 @@ func loadConfig() (config, error) {
 		ForwardConcurrency: getenvInt("FORWARD_CONCURRENCY", 1),
 		QueueTimeout:       time.Duration(getenvInt("QUEUE_TIMEOUT", 120)) * time.Second,
 
-		PromptFile: getenvDefault("PROMPT_FILE", "sounds/start.wav"),
+		PromptFile: getenvDefault("PROMPT_FILE", "sounds/calling-forward.wav"),
 		HoldFile:   getenvDefault("HOLD_FILE", "sounds/waiting-queue.wav"),
 	}
 	if c.Domain == "" || c.User == "" || c.Pass == "" {
@@ -249,6 +249,12 @@ func run(ctx context.Context, cfg config, callDest string) error {
 	forward.sem = make(chan struct{}, cfg.ForwardConcurrency)
 	forward.timeout = cfg.QueueTimeout
 	forward.holdFile = cfg.HoldFile
+
+	if cfg.ForwardTo != "" {
+		slog.Info("audio clips",
+			"prompt", cfg.PromptFile, "prompt_from", audioSource(cfg.PromptFile),
+			"hold", cfg.HoldFile, "hold_from", audioSource(cfg.HoldFile))
+	}
 
 	// Answer inbound calls. With FORWARD_TO set this is a "press 1 to forward"
 	// IVR; otherwise it plays a prompt and echoes.
@@ -505,17 +511,31 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 	}
 }
 
-// openAudio opens a WAV clip: a file on disk if the path exists, otherwise a
-// bundled demo clip by name. The caller must Close the returned reader.
+// openAudio opens a WAV clip: a file on disk if the path exists, else a bundled
+// clip by that name, else a guaranteed bundled fallback so callers never hear
+// pure silence. The caller must Close the returned reader.
 func openAudio(name string) (io.ReadCloser, error) {
 	if f, err := os.Open(name); err == nil {
 		return f, nil
 	}
-	f, err := testdata.OpenFile(name)
-	if err != nil {
-		return nil, fmt.Errorf("audio %q: not a file on disk and not a bundled clip: %w", name, err)
+	if f, err := testdata.OpenFile(name); err == nil {
+		return f, nil
 	}
-	return f, nil
+	slog.Warn("audio file not found — using bundled fallback clip", "file", name)
+	f, err := testdata.OpenFile("demo-echotest.wav")
+	return f, err
+}
+
+// audioSource reports where a clip will load from, for the startup log.
+func audioSource(name string) string {
+	if _, err := os.Stat(name); err == nil {
+		return "disk"
+	}
+	if f, err := testdata.OpenFile(name); err == nil {
+		_ = f.Close()
+		return "bundled"
+	}
+	return "MISSING(fallback)"
 }
 
 // loopPlay plays a WAV clip repeatedly until stop is closed, keeping outbound RTP
