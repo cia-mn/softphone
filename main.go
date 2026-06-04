@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emiago/diago"
@@ -202,7 +203,12 @@ func run(ctx context.Context, cfg config, callDest string) error {
 	if ip := net.ParseIP(publicIP); ip != nil {
 		tr.MediaExternalIP = ip
 	}
-	dg := diago.NewDiago(ua, diago.WithTransport(tr))
+	dg := diago.NewDiago(ua,
+		diago.WithTransport(tr),
+		// Mobinet sends DTMF as SIP INFO (application/dtmf-relay), which diago's
+		// server side doesn't process — we intercept it ourselves.
+		diago.WithServerRequestMiddleware(dtmfInfoMiddleware),
+	)
 
 	logArgs := []any{
 		"aor", recipientStr,
@@ -342,8 +348,85 @@ func placeCall(ctx context.Context, dg *diago.Diago, cfg config, dest string) er
 	return nil
 }
 
-// errDigitMatched stops DTMF Listen once the wanted key is pressed.
-var errDigitMatched = errors.New("dtmf digit matched")
+// --- DTMF over SIP INFO ---------------------------------------------------
+// Mobinet/VoipSwitch sends DTMF as SIP INFO (application/dtmf-relay), which
+// diago's server side answers with 406. We intercept INFO in a request
+// middleware, parse the digit, and route it to the per-call channel that the
+// forward handler waits on.
+
+var dtmfHub = struct {
+	mu sync.Mutex
+	m  map[string]chan rune
+}{m: make(map[string]chan rune)}
+
+func dtmfRegister(callID string) chan rune {
+	ch := make(chan rune, 8)
+	dtmfHub.mu.Lock()
+	dtmfHub.m[callID] = ch
+	dtmfHub.mu.Unlock()
+	return ch
+}
+
+func dtmfUnregister(callID string) {
+	dtmfHub.mu.Lock()
+	delete(dtmfHub.m, callID)
+	dtmfHub.mu.Unlock()
+}
+
+func dtmfDeliver(callID string, d rune) {
+	dtmfHub.mu.Lock()
+	ch := dtmfHub.m[callID]
+	dtmfHub.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- d:
+		default:
+		}
+	}
+}
+
+// dtmfInfoMiddleware handles DTMF delivered as SIP INFO and passes every other
+// request straight through to diago.
+func dtmfInfoMiddleware(next sipgo.RequestHandler) sipgo.RequestHandler {
+	return func(req *sip.Request, tx sip.ServerTransaction) {
+		if req.Method == sip.INFO {
+			if d, ok := parseInfoDTMF(req); ok {
+				slog.Info("DTMF received (SIP INFO)", "digit", string(d))
+				dtmfDeliver(req.CallID().Value(), d)
+				_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
+				return
+			}
+		}
+		next(req, tx)
+	}
+}
+
+// parseInfoDTMF extracts a DTMF digit from a SIP INFO body — either
+// application/dtmf-relay ("Signal=1\r\nDuration=...") or application/dtmf ("1").
+func parseInfoDTMF(req *sip.Request) (rune, bool) {
+	ct := ""
+	if h := req.ContentType(); h != nil {
+		ct = strings.ToLower(h.Value())
+	}
+	body := strings.TrimSpace(string(req.Body()))
+	if body == "" {
+		return 0, false
+	}
+	if strings.Contains(ct, "dtmf-relay") {
+		for _, line := range strings.Split(body, "\n") {
+			if v, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(line)), "signal="); ok {
+				if v = strings.TrimSpace(v); v != "" {
+					return rune(v[0]), true
+				}
+			}
+		}
+		return 0, false
+	}
+	if strings.Contains(ct, "dtmf") {
+		return rune(body[0]), true
+	}
+	return 0, false
+}
 
 // handleInbound answers an incoming call. With FORWARD_TO set it waits for the
 // caller to press 1 and then bridges them to that number (call forwarding);
@@ -366,22 +449,21 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 
 	slog.Info("ANSWERED ✓ — playing prompt, waiting for caller to press 1", "forward_to", cfg.ForwardTo)
 
-	// Play a prompt on a loop WHILE listening for DTMF. The continuous outbound
-	// RTP keeps the media path latched through NAT — so the caller's RTP (and the
-	// DTMF telephone-event packets) actually reach us — and it cues the caller.
-	// (Reading DTMF only sets a read deadline, so a concurrent write is safe.)
+	// Mobinet delivers DTMF as SIP INFO; the middleware feeds digits to this channel.
+	callID := in.InviteRequest.CallID().Value()
+	digits := dtmfRegister(callID)
+	defer dtmfUnregister(callID)
+
+	// Play a prompt on a loop to cue the caller and keep the call's media alive
+	// while we wait. Stop it before doing anything else with the media.
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() { defer close(done); loopPrompt(in, stop) }()
 
-	matched, err := waitForDigit(in, '1', 20*time.Second)
-	close(stop) // stop the prompt …
-	<-done      // … and wait for it to stop writing before we touch the media again
+	matched := waitForForwardDigit(in, digits, '1', 20*time.Second)
+	close(stop)
+	<-done
 
-	if err != nil {
-		slog.Error("DTMF listen failed", "error", err)
-		return
-	}
 	if !matched {
 		slog.Info("no '1' pressed within timeout — hanging up")
 		return
@@ -429,19 +511,23 @@ func (s *stoppableReader) Read(p []byte) (int, error) {
 	}
 }
 
-// waitForDigit listens for DTMF and reports whether `want` was pressed within timeout.
-func waitForDigit(in *diago.DialogServerSession, want rune, timeout time.Duration) (bool, error) {
-	err := in.AudioReaderDTMF().Listen(func(d rune) error {
-		slog.Info("DTMF received", "digit", string(d))
-		if d == want {
-			return errDigitMatched
+// waitForForwardDigit waits for `want` on the per-call DTMF channel (fed by the
+// SIP INFO middleware), returning false on timeout or if the caller hangs up.
+func waitForForwardDigit(in *diago.DialogServerSession, digits <-chan rune, want rune, timeout time.Duration) bool {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	for {
+		select {
+		case d := <-digits:
+			if d == want {
+				return true
+			}
+		case <-t.C:
+			return false
+		case <-in.Context().Done():
+			return false
 		}
-		return nil
-	}, timeout)
-	if errors.Is(err, errDigitMatched) {
-		return true, nil
 	}
-	return false, err // nil here means the timeout elapsed with no match
 }
 
 // forwardCall bridges the (already answered) caller to cfg.ForwardTo by placing a
