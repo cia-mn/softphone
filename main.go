@@ -106,6 +106,11 @@ type config struct {
 	// once; extra callers wait (hearing hold audio) in a FIFO queue up to QueueTimeout.
 	ForwardConcurrency int           // FORWARD_CONCURRENCY (default 1)
 	QueueTimeout       time.Duration // QUEUE_TIMEOUT seconds (default 120)
+
+	// Audio clips (8 kHz mono 16-bit WAV). A path on disk is used if it exists;
+	// otherwise the name falls back to a bundled demo clip.
+	PromptFile string // PROMPT_FILE  played on inbound while waiting for the keypress
+	HoldFile   string // HOLD_FILE    hold audio while a caller waits in the forward queue
 }
 
 func loadConfig() (config, error) {
@@ -129,6 +134,9 @@ func loadConfig() (config, error) {
 		ForwardTo:          os.Getenv("FORWARD_TO"),
 		ForwardConcurrency: getenvInt("FORWARD_CONCURRENCY", 1),
 		QueueTimeout:       time.Duration(getenvInt("QUEUE_TIMEOUT", 120)) * time.Second,
+
+		PromptFile: getenvDefault("PROMPT_FILE", "sounds/start.wav"),
+		HoldFile:   getenvDefault("HOLD_FILE", "sounds/waiting-queue.wav"),
 	}
 	if c.Domain == "" || c.User == "" || c.Pass == "" {
 		return c, errors.New("SIP_DOMAIN, SIP_USER and SIP_PASS must be set (copy .env.example to .env and fill them in)")
@@ -240,6 +248,7 @@ func run(ctx context.Context, cfg config, callDest string) error {
 	// Forward queue: cap concurrent forwards; extra callers wait (on hold) FIFO.
 	forward.sem = make(chan struct{}, cfg.ForwardConcurrency)
 	forward.timeout = cfg.QueueTimeout
+	forward.holdFile = cfg.HoldFile
 
 	// Answer inbound calls. With FORWARD_TO set this is a "press 1 to forward"
 	// IVR; otherwise it plays a prompt and echoes.
@@ -458,7 +467,7 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 
 	if cfg.ForwardTo == "" {
 		slog.Info("ANSWERED ✓ — no FORWARD_TO set; playing prompt then echo")
-		playPromptAndEcho(in)
+		playPromptAndEcho(in, cfg.PromptFile)
 		return
 	}
 
@@ -469,11 +478,11 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 	digits := dtmfRegister(callID)
 	defer dtmfUnregister(callID)
 
-	// Play a prompt on a loop to cue the caller and keep the call's media alive
+	// Play the prompt on a loop to cue the caller and keep the call's media alive
 	// while we wait. Stop it before doing anything else with the media.
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	go func() { defer close(done); loopPlay(in, "demo-echotest.wav", stop) }()
+	go func() { defer close(done); loopPlay(in, cfg.PromptFile, stop) }()
 
 	matched := waitForForwardDigit(in, digits, '1', 20*time.Second)
 	close(stop)
@@ -496,8 +505,21 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 	}
 }
 
-// loopPlay plays a clip from testdata repeatedly until stop is closed, keeping
-// outbound RTP flowing (NAT latch / hold music) and giving the caller audio.
+// openAudio opens a WAV clip: a file on disk if the path exists, otherwise a
+// bundled demo clip by name. The caller must Close the returned reader.
+func openAudio(name string) (io.ReadCloser, error) {
+	if f, err := os.Open(name); err == nil {
+		return f, nil
+	}
+	f, err := testdata.OpenFile(name)
+	if err != nil {
+		return nil, fmt.Errorf("audio %q: not a file on disk and not a bundled clip: %w", name, err)
+	}
+	return f, nil
+}
+
+// loopPlay plays a WAV clip repeatedly until stop is closed, keeping outbound RTP
+// flowing (NAT latch / hold music) and giving the caller something to hear.
 func loopPlay(in *diago.DialogServerSession, file string, stop <-chan struct{}) {
 	pb, err := in.PlaybackCreate()
 	if err != nil {
@@ -510,12 +532,18 @@ func loopPlay(in *diago.DialogServerSession, file string, stop <-chan struct{}) 
 			return
 		default:
 		}
-		wav, err := testdata.OpenFile(file)
+		f, err := openAudio(file)
 		if err != nil {
+			slog.Warn("open audio", "file", file, "error", err)
 			return
 		}
-		_, _ = pb.Play(&stoppableReader{r: wav, stop: stop}, "audio/wav")
-		wav.Close()
+		_, err = pb.Play(&stoppableReader{r: f, stop: stop}, "audio/wav")
+		f.Close()
+		if err != nil {
+			// e.g. the WAV isn't 8 kHz mono 16-bit — stop rather than busy-loop.
+			slog.Warn("play audio (must be 8kHz mono 16-bit WAV)", "file", file, "error", err)
+			return
+		}
 	}
 }
 
@@ -556,8 +584,9 @@ func waitForForwardDigit(in *diago.DialogServerSession, digits <-chan rune, want
 // forward limits concurrent forwards and holds extra callers in a FIFO queue.
 // A buffered slot in sem == one active forward; Go wakes blocked senders in order.
 var forward struct {
-	sem     chan struct{}
-	timeout time.Duration
+	sem      chan struct{}
+	timeout  time.Duration
+	holdFile string
 }
 
 // acquireForwardSlot takes a forward slot. If all are busy it holds the caller
@@ -575,7 +604,7 @@ func acquireForwardSlot(in *diago.DialogServerSession) bool {
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	go func() { defer close(done); loopPlay(in, "demo-echotest.wav", stop) }()
+	go func() { defer close(done); loopPlay(in, forward.holdFile, stop) }()
 	defer func() { close(stop); <-done }()
 
 	t := time.NewTimer(forward.timeout)
@@ -641,8 +670,8 @@ func forwardCall(dg *diago.Diago, cfg config, in *diago.DialogServerSession) err
 
 // playPromptAndEcho plays the echo-test prompt, then echoes the caller's audio
 // back until they hang up (the fallback when no FORWARD_TO is configured).
-func playPromptAndEcho(in *diago.DialogServerSession) {
-	if wav, err := testdata.OpenFile("demo-echotest.wav"); err != nil {
+func playPromptAndEcho(in *diago.DialogServerSession, file string) {
+	if wav, err := openAudio(file); err != nil {
 		slog.Warn("open prompt", "error", err)
 	} else {
 		defer wav.Close()

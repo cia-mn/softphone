@@ -24,6 +24,12 @@ services:
     # All configuration — SIP_USER, SIP_PASS, FORWARD_TO, BIND_HOST=<public ip>, …
     env_file: .env
 
+    # Prompt / hold-music WAVs (referenced by PROMPT_FILE / HOLD_FILE). The
+    # container's working dir is /, so the default sounds/*.wav paths resolve to
+    # /sounds/*.wav. Put your converted WAVs in ./sounds next to this file.
+    volumes:
+      - ./sounds:/sounds:ro
+
     logging:
       driver: json-file
       options:

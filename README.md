@@ -34,6 +34,26 @@ go run . call 99xxxxxx   # register, then place a call and play a test clip
   run at once — extra callers are held on hold in a FIFO queue up to `QUEUE_TIMEOUT`.
 - **Outbound** (`call <number>`): dials and plays a test clip on answer.
 
+## Custom audio (prompt / hold music)
+
+Calls use **8 kHz mono 16-bit WAV**. Convert any MP3 with ffmpeg:
+
+```sh
+ffmpeg -i sounds/start.mp3 -ar 8000 -ac 1 -c:a pcm_s16le sounds/start.wav
+```
+
+Point the app at the WAVs (these are the defaults):
+
+```ini
+PROMPT_FILE=sounds/start.wav          # played while waiting for "press 1"
+HOLD_FILE=sounds/waiting-queue.wav    # hold music for queued callers
+```
+
+A path that doesn't exist falls back to a bundled demo clip. In Docker the
+compose file mounts `./sounds` → `/sounds`, and the container's working dir is
+`/`, so the default `sounds/*.wav` paths resolve to `/sounds/*.wav`. For plain
+`docker run`, add `-v "$PWD/sounds:/sounds"`.
+
 ## Deploy (Docker / GHCR)
 
 > ⚠️ **Inbound calls need a publicly reachable host.** Behind NAT the carrier
