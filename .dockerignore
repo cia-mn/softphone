@@ -1,0 +1,11 @@
+# Keep secrets and local-only/bulk files out of the build context.
+.env
+.env.*
+*.log
+*.mp3
+/softphone
+.git
+.github
+README.md
+Dockerfile
+.dockerignore
