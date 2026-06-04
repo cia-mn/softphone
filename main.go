@@ -868,9 +868,10 @@ func getenvInt(key string, def int) int {
 	return def
 }
 
-// loadDotEnv loads KEY=VALUE lines from path into the process environment
-// without overriding variables that are already set. Lines starting with '#'
-// and blank lines are ignored; surrounding quotes on values are stripped.
+// loadDotEnv loads KEY=VALUE lines from path into the process environment without
+// overriding variables that are already set. Blank lines and #-comment lines are
+// ignored, an inline "# comment" after a value is stripped, and a quoted value is
+// taken literally (including any '#').
 func loadDotEnv(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -881,15 +882,39 @@ func loadDotEnv(path string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		key, val, ok := strings.Cut(line, "=")
+		key, raw, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
 		}
 		key = strings.TrimSpace(key)
-		val = strings.Trim(strings.TrimSpace(val), `"'`)
 		if _, exists := os.LookupEnv(key); !exists {
-			_ = os.Setenv(key, val)
+			_ = os.Setenv(key, parseEnvValue(raw))
 		}
 	}
 	return nil
+}
+
+// parseEnvValue trims a .env value: a quoted value is returned literally; an
+// unquoted value has any inline comment (a '#' at the start or after whitespace)
+// stripped. A '#' that is part of the value (e.g. inside a password) is kept.
+func parseEnvValue(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	if v[0] == '"' || v[0] == '\'' {
+		if end := strings.IndexByte(v[1:], v[0]); end >= 0 {
+			return v[1 : 1+end]
+		}
+		return v[1:]
+	}
+	if v[0] == '#' {
+		return ""
+	}
+	for i := 1; i < len(v); i++ {
+		if v[i] == '#' && (v[i-1] == ' ' || v[i-1] == '\t') {
+			return strings.TrimSpace(v[:i])
+		}
+	}
+	return v
 }
