@@ -114,6 +114,7 @@ type config struct {
 	HoldFile       string // HOLD_FILE        hold audio while a caller waits in the forward queue
 
 	HTTPAddr string // HTTP_ADDR  REST API listen address (default ":8080"; empty disables)
+	APIKey   string // API_KEY    bearer token required for protected endpoints (/sms, /status)
 
 	// SMS via Mobinet's web portal (not SIP). SMS_PASS is required to enable it.
 	SMSPortalURL string // SMS_PORTAL_URL  portal base URL (default https://phone.mobinet.mn)
@@ -148,6 +149,7 @@ func loadConfig() (config, error) {
 		HoldFile:       getenvDefault("HOLD_FILE", "sounds/waiting-queue.wav"),
 
 		HTTPAddr: getenvDefault("HTTP_ADDR", ":8080"),
+		APIKey:   os.Getenv("API_KEY"),
 
 		SMSPortalURL: getenvDefault("SMS_PORTAL_URL", "https://phone.mobinet.mn"),
 		SMSUser:      os.Getenv("SMS_USER"),
@@ -287,8 +289,11 @@ func run(ctx context.Context, cfg config, callDest string) error {
 
 	// Start the HTTP control API (status, OpenAPI docs, …) alongside the SIP service.
 	if cfg.HTTPAddr != "" {
+		if cfg.APIKey == "" {
+			slog.Warn("API_KEY not set — protected endpoints (/sms, /status) are locked until you set it")
+		}
 		go func() {
-			if err := startAPIServer(ctx, cfg.HTTPAddr); err != nil {
+			if err := startAPIServer(ctx, cfg.HTTPAddr, cfg.APIKey); err != nil {
 				slog.Error("HTTP API stopped", "error", err)
 			}
 		}()

@@ -4,8 +4,10 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,11 +36,34 @@ func setRegistered(registered bool, account, server string) {
 }
 
 // startAPIServer runs the HTTP API until ctx is cancelled, then shuts down gracefully.
-func startAPIServer(ctx context.Context, addr string) error {
+// Operations that declare Security require an "Authorization: Bearer <apiKey>" header.
+func startAPIServer(ctx context.Context, addr, apiKey string) error {
 	router := chi.NewMux()
 	router.Use(middleware.Recoverer)
 
-	api := humachi.New(router, huma.DefaultConfig("Softphone API", "0.1.0"))
+	config := huma.DefaultConfig("Softphone API", "0.1.0")
+	config.Components.SecuritySchemes = map[string]*huma.SecurityScheme{
+		"bearer": {Type: "http", Scheme: "bearer", BearerFormat: "API key"},
+	}
+	api := humachi.New(router, config)
+
+	// Enforce the API key on any operation that declares Security (e.g. /sms, /status).
+	api.UseMiddleware(func(hctx huma.Context, next func(huma.Context)) {
+		if len(hctx.Operation().Security) == 0 {
+			next(hctx) // public endpoint (e.g. /health, docs)
+			return
+		}
+		if apiKey == "" {
+			_ = huma.WriteErr(api, hctx, http.StatusServiceUnavailable, "API authentication not configured (set API_KEY)")
+			return
+		}
+		if !validBearer(hctx.Header("Authorization"), apiKey) {
+			_ = huma.WriteErr(api, hctx, http.StatusUnauthorized, "missing or invalid API key")
+			return
+		}
+		next(hctx)
+	})
+
 	registerAPIRoutes(api)
 
 	srv := &http.Server{
@@ -60,7 +85,22 @@ func startAPIServer(ctx context.Context, addr string) error {
 	return nil
 }
 
+// validBearer reports whether the Authorization header carries the expected key.
+func validBearer(header, key string) bool {
+	const prefix = "Bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return false
+	}
+	got := strings.TrimSpace(header[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(key)) == 1
+}
+
 func registerAPIRoutes(api huma.API) {
+	// secured marks an operation as requiring the bearer API key.
+	secured := func(o *huma.Operation) {
+		o.Security = []map[string][]string{{"bearer": {}}}
+	}
+
 	huma.Get(api, "/health", func(ctx context.Context, _ *struct{}) (*HealthOutput, error) {
 		out := &HealthOutput{}
 		out.Body.Status = "ok"
@@ -76,7 +116,7 @@ func registerAPIRoutes(api huma.API) {
 		out.Body.Server = apiState.server
 		out.Body.UptimeSeconds = int64(time.Since(startedAt).Seconds())
 		return out, nil
-	})
+	}, secured)
 
 	huma.Post(api, "/sms", func(ctx context.Context, in *SMSInput) (*SMSOutput, error) {
 		if smsSend == nil {
@@ -91,7 +131,7 @@ func registerAPIRoutes(api huma.API) {
 		out.Body.Response = response
 		out.Body.Accepted = status == 200
 		return out, nil
-	})
+	}, secured)
 }
 
 // SMSInput is the POST /sms request body.
