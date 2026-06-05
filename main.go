@@ -112,6 +112,8 @@ type config struct {
 	PromptFile     string // PROMPT_FILE      greeting played while waiting for the keypress
 	ConnectingFile string // CONNECTING_FILE  "connecting…" played while the forward leg rings
 	HoldFile       string // HOLD_FILE        hold audio while a caller waits in the forward queue
+
+	HTTPAddr string // HTTP_ADDR  REST API listen address (default ":8080"; empty disables)
 }
 
 func loadConfig() (config, error) {
@@ -139,6 +141,8 @@ func loadConfig() (config, error) {
 		PromptFile:     getenvDefault("PROMPT_FILE", "sounds/start.wav"),
 		ConnectingFile: getenvDefault("CONNECTING_FILE", "sounds/calling-forward.wav"),
 		HoldFile:       getenvDefault("HOLD_FILE", "sounds/waiting-queue.wav"),
+
+		HTTPAddr: getenvDefault("HTTP_ADDR", ":8080"),
 	}
 	if c.Domain == "" || c.User == "" || c.Pass == "" {
 		return c, errors.New("SIP_DOMAIN, SIP_USER and SIP_PASS must be set (copy .env.example to .env and fill them in)")
@@ -260,6 +264,15 @@ func run(ctx context.Context, cfg config, callDest string) error {
 			"hold", cfg.HoldFile, "hold_from", audioSource(cfg.HoldFile))
 	}
 
+	// Start the HTTP control API (status, OpenAPI docs, …) alongside the SIP service.
+	if cfg.HTTPAddr != "" {
+		go func() {
+			if err := startAPIServer(ctx, cfg.HTTPAddr); err != nil {
+				slog.Error("HTTP API stopped", "error", err)
+			}
+		}()
+	}
+
 	// Answer inbound calls. With FORWARD_TO set this is a "press 1 to forward"
 	// IVR; otherwise it plays a prompt and echoes.
 	go func() {
@@ -282,6 +295,7 @@ func run(ctx context.Context, cfg config, callDest string) error {
 			Expiry:    cfg.Expiry,
 			OnRegistered: func() {
 				slog.Info("REGISTERED ✓")
+				setRegistered(true, cfg.User, serverHost)
 				select {
 				case registered <- struct{}{}:
 				default:

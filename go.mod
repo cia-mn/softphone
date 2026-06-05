@@ -3,9 +3,14 @@ module github.com/cia-mn/softphone
 go 1.26.3
 
 require (
-	github.com/emiago/diago v0.28.0 // indirect
+	github.com/danielgtaylor/huma/v2 v2.38.0
+	github.com/emiago/diago v0.28.0
+	github.com/emiago/sipgo v1.4.0
+	github.com/go-chi/chi/v5 v5.3.0
+)
+
+require (
 	github.com/emiago/dtls/v3 v3.0.0-20260122183559-8b8d23e359c0 // indirect
-	github.com/emiago/sipgo v1.4.0 // indirect
 	github.com/go-audio/riff v1.0.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
@@ -20,8 +25,8 @@ require (
 	github.com/pion/transport/v3 v3.1.1 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/zaf/g711 v1.4.0 // indirect
-	golang.org/x/crypto v0.32.0 // indirect
+	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302 // indirect
 )
