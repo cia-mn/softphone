@@ -82,14 +82,14 @@ func registerAPIRoutes(api huma.API) {
 		if smsSend == nil {
 			return nil, huma.Error503ServiceUnavailable("SMS not available (SIP not ready)")
 		}
-		status, reason, err := smsSend(ctx, in.Body.To, in.Body.Text)
+		status, response, err := smsSend(ctx, in.Body.To, in.Body.Text)
 		if err != nil {
 			return nil, huma.Error502BadGateway("failed to send SMS", err)
 		}
 		out := &SMSOutput{}
 		out.Body.Status = status
-		out.Body.Reason = reason
-		out.Body.Accepted = status >= 200 && status < 300
+		out.Body.Response = response
+		out.Body.Accepted = status == 200
 		return out, nil
 	})
 }
@@ -102,12 +102,12 @@ type SMSInput struct {
 	}
 }
 
-// SMSOutput reports what the SIP provider replied.
+// SMSOutput reports what Mobinet's web portal replied.
 type SMSOutput struct {
 	Body struct {
-		Accepted bool   `json:"accepted" doc:"True if the provider accepted the message (2xx, usually 202)"`
-		Status   int    `json:"status" doc:"SIP response status code"`
-		Reason   string `json:"reason" doc:"SIP response reason phrase"`
+		Accepted bool   `json:"accepted" doc:"True if the portal accepted the request (HTTP 200)"`
+		Status   int    `json:"status" doc:"Portal HTTP status code"`
+		Response string `json:"response" doc:"Portal response body (truncated)"`
 	}
 }
 
