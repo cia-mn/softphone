@@ -235,6 +235,13 @@ func run(ctx context.Context, cfg config, callDest string) error {
 		diago.WithServerRequestMiddleware(dtmfInfoMiddleware),
 	)
 
+	// Wire the SMS sender (used by POST /sms) now that the UA/transport exist.
+	if sender, serr := newSMSSender(ua, cfg, serverHost); serr != nil {
+		slog.Warn("SMS sending unavailable", "error", serr)
+	} else {
+		smsSend = sender
+	}
+
 	logArgs := []any{
 		"aor", recipientStr,
 		"auth_user", cfg.AuthUser,
@@ -788,6 +795,47 @@ func normalizeDigestScheme(canonicalName string) sip.HeaderParser {
 		}
 		return sip.NewHeader(canonicalName, data), nil
 	}
+}
+
+// smsSend sends an SMS via SIP MESSAGE. It is nil until the UA is ready, and is
+// read by the HTTP API's POST /sms handler.
+var smsSend func(ctx context.Context, to, text string) (status int, reason string, err error)
+
+// newSMSSender returns a function that sends an SMS as a SIP MESSAGE to
+// to@domain, authenticated with the account's digest credentials. VoipSwitch
+// routes it to its SMS gateway (if SMS is enabled on the account).
+func newSMSSender(ua *sipgo.UserAgent, cfg config, serverHost string) (func(context.Context, string, string) (int, string, error), error) {
+	client, err := sipgo.NewClient(ua, sipgo.WithClientNAT())
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, to, text string) (int, string, error) {
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		recipientStr := fmt.Sprintf("sip:%s@%s", to, cfg.Domain)
+		var recipient sip.Uri
+		if err := sip.ParseUri(recipientStr, &recipient); err != nil {
+			return 0, "", fmt.Errorf("parse recipient %q: %w", recipientStr, err)
+		}
+		req := sip.NewRequest(sip.MESSAGE, recipient)
+		req.AppendHeader(sip.NewHeader("Content-Type", "text/plain"))
+		req.SetBody([]byte(text))
+		req.SetDestination(serverHost)
+
+		res, err := client.Do(ctx, req, sipgo.ClientRequestBuild)
+		if err != nil {
+			return 0, "", err
+		}
+		if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
+			res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{Username: cfg.AuthUser, Password: cfg.Pass})
+			if err != nil {
+				return 0, "", err
+			}
+		}
+		slog.Info("sms sent", "to", to, "result", res.StartLine())
+		return res.StatusCode, res.Reason, nil
+	}, nil
 }
 
 // resolveServer turns a SIP domain into a concrete host:port to send packets to.

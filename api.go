@@ -77,6 +77,38 @@ func registerAPIRoutes(api huma.API) {
 		out.Body.UptimeSeconds = int64(time.Since(startedAt).Seconds())
 		return out, nil
 	})
+
+	huma.Post(api, "/sms", func(ctx context.Context, in *SMSInput) (*SMSOutput, error) {
+		if smsSend == nil {
+			return nil, huma.Error503ServiceUnavailable("SMS not available (SIP not ready)")
+		}
+		status, reason, err := smsSend(ctx, in.Body.To, in.Body.Text)
+		if err != nil {
+			return nil, huma.Error502BadGateway("failed to send SMS", err)
+		}
+		out := &SMSOutput{}
+		out.Body.Status = status
+		out.Body.Reason = reason
+		out.Body.Accepted = status >= 200 && status < 300
+		return out, nil
+	})
+}
+
+// SMSInput is the POST /sms request body.
+type SMSInput struct {
+	Body struct {
+		To   string `json:"to" doc:"Destination number, as Mobinet expects it" example:"99112233" minLength:"3" maxLength:"20"`
+		Text string `json:"text" doc:"Message text" example:"Hello from the softphone" minLength:"1" maxLength:"1000"`
+	}
+}
+
+// SMSOutput reports what the SIP provider replied.
+type SMSOutput struct {
+	Body struct {
+		Accepted bool   `json:"accepted" doc:"True if the provider accepted the message (2xx, usually 202)"`
+		Status   int    `json:"status" doc:"SIP response status code"`
+		Reason   string `json:"reason" doc:"SIP response reason phrase"`
+	}
 }
 
 // HealthOutput is the liveness response.
