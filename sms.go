@@ -24,7 +24,6 @@ type portalSMS struct {
 	pass string
 	hc   *http.Client
 	mu   sync.Mutex
-	in   bool // whether we currently hold a logged-in session
 }
 
 func newPortalSMS(base, user, pass string) *portalSMS {
@@ -74,7 +73,6 @@ func (p *portalSMS) login(ctx context.Context) error {
 	if !p.hasSession() {
 		return fmt.Errorf("portal login failed (check SMS_USER/SMS_PASS)")
 	}
-	p.in = true
 	return nil
 }
 
@@ -105,17 +103,19 @@ func (p *portalSMS) send(ctx context.Context, to, text string) (int, string, err
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.in {
-		if err := p.login(ctx); err != nil {
-			return 0, "", err
-		}
+	// Log in fresh for every send. The portal session expires after a while (seen
+	// ~2h) and an expired session isn't reliably signalled — it can still answer
+	// 200 — so caching it causes silent failures until a restart. OTP volume is
+	// low, so one login per send is a fine trade for reliability.
+	if err := p.login(ctx); err != nil {
+		return 0, "", err
 	}
 	status, body, err := p.postSMS(ctx, to, text)
 	if err != nil {
 		return 0, "", err
 	}
+	// Safety net: if the session was still rejected, log in again and retry once.
 	if status == http.StatusFound || status == http.StatusUnauthorized || status == http.StatusForbidden {
-		p.in = false
 		if err := p.login(ctx); err != nil {
 			return 0, "", err
 		}
