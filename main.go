@@ -521,25 +521,20 @@ func handleInbound(dg *diago.Diago, cfg config, in *diago.DialogServerSession) {
 		return
 	}
 
-	slog.Info("ANSWERED ✓ — playing prompt, waiting for caller to press 1", "forward_to", cfg.ForwardTo)
+	slog.Info("ANSWERED ✓ — playing prompt once, then waiting up to 15s for the caller to press 1", "forward_to", cfg.ForwardTo)
 
 	// Mobinet delivers DTMF as SIP INFO; the middleware feeds digits to this channel.
 	callID := in.InviteRequest.CallID().Value()
 	digits := dtmfRegister(callID)
 	defer dtmfUnregister(callID)
 
-	// Play the prompt on a loop to cue the caller and keep the call's media alive
-	// while we wait. Stop it before doing anything else with the media.
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() { defer close(done); loopPlay(in, cfg.PromptFile, stop) }()
+	// Play the prompt ONCE (not looped), then wait up to 15s for a keypress. DTMF
+	// arrives as SIP INFO, so a press during or after the prompt is still captured
+	// (the per-call digit channel is registered above, before playback).
+	playOnce(in, cfg.PromptFile)
 
-	matched := waitForForwardDigit(in, digits, '1', 20*time.Second)
-	close(stop)
-	<-done
-
-	if !matched {
-		slog.Info("no '1' pressed within timeout — hanging up")
+	if !waitForForwardDigit(in, digits, '1', 15*time.Second) {
+		slog.Info("no '1' pressed within 15s — hanging up")
 		return
 	}
 
@@ -580,6 +575,24 @@ func audioSource(name string) string {
 		return "bundled"
 	}
 	return "MISSING(fallback)"
+}
+
+// playOnce plays a WAV clip a single time (best effort; logs and returns on error).
+func playOnce(in *diago.DialogServerSession, file string) {
+	f, err := openAudio(file)
+	if err != nil {
+		slog.Warn("open audio", "file", file, "error", err)
+		return
+	}
+	defer f.Close()
+	pb, err := in.PlaybackCreate()
+	if err != nil {
+		slog.Warn("create playback", "error", err)
+		return
+	}
+	if _, err := pb.Play(f, "audio/wav"); err != nil {
+		slog.Warn("play audio (is it 8kHz mono 16-bit WAV?)", "file", file, "error", err)
+	}
 }
 
 // loopPlay plays a WAV clip repeatedly until stop is closed, keeping outbound RTP
